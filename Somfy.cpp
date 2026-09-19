@@ -2861,6 +2861,10 @@ void SomfyShade::setMyPosition(int8_t pos, int8_t tilt) {
     }
   }
 }
+bool SomfyShade::hasMyPosition() {
+  if(this->tiltType == tilt_types::tiltonly) return this->myTiltPos >= 0.0f;
+  return this->myPos >= 0.0f || (this->tiltType != tilt_types::none && this->myTiltPos >= 0.0f);
+}
 void SomfyShade::moveToMyPosition() {
   if(!this->isIdle()) return;
   Serial.println("Moving to My Position");
@@ -2932,7 +2936,10 @@ void SomfyShade::sendCommand(somfy_commands cmd, uint8_t repeat, uint8_t stepSiz
       SomfyRemote::sendCommand(cmd, repeat);
     else if(this->shadeType == shade_types::drycontact2) return;   
     else if(this->isIdle()) {
-      this->moveToMyPosition();      
+      // With no favorite configured the press can only mean stop, and the motor may still be
+      // moving if it missed the frame that made us think it was idle, so send it anyway.
+      if(this->hasMyPosition()) this->moveToMyPosition();
+      else SomfyRemote::sendCommand(cmd, repeat);
       return;
     }
     else {
