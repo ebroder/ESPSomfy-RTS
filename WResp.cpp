@@ -33,6 +33,12 @@ void JsonSockEvent::_safecat(const char *val, bool escape) {
   else strcat(this->buff, val);
   if(escape) strcat(this->buff, "\"");
 }
+void JsonPayload::begin(char *buff, size_t buffSize) {
+  this->buff = buff;
+  this->buffSize = buffSize;
+  this->buff[0] = 0x00;
+  this->_nocomma = true;
+}
 void JsonResponse::beginResponse(WebServer *server, char *buff, size_t buffSize) {
   this->server = server;
   this->buff = buff;

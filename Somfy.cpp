@@ -3616,6 +3616,7 @@ void SomfyShadeController::publish() {
     if(group) continue;
     else SomfyGroup::unpublish(i);
   }
+  this->transceiver.publishLogDisco();
 }
 uint8_t SomfyShadeController::getNextShadeId() {
   // There is no shortcut for this since the deletion of
@@ -4684,6 +4685,92 @@ void Transceiver::emitFrame(somfy_frame_t *frame, somfy_rx_t *rx) {
     */
   }
 }
+static void txLogEntryToJSON(JsonFormatter &json, somfy_tx_log_t &entry) {
+  json.beginObject();
+  json.addElem("time", entry.time);
+  json.addElem("address", entry.remoteAddress);
+  json.addElem("rcode", (uint32_t)entry.rollingCode);
+  json.addElem("command", translateSomfyCommand(static_cast<somfy_commands>(entry.cmd)).c_str());
+  json.addElem("frames", entry.frames);
+  json.addElem("marcState", entry.marcState);
+  json.beginArray("late");
+  for(uint8_t i = 0; i < entry.frames && i < TX_LOG_FRAMES; i++) json.addElem((uint32_t)entry.late[i]);
+  json.endArray();
+  json.endObject();
+}
+static void rxLogEntryToJSON(JsonFormatter &json, somfy_rx_log_t &entry) {
+  json.beginObject();
+  json.addElem("time", entry.time);
+  json.addElem("address", entry.remoteAddress);
+  json.addElem("rcode", (uint32_t)entry.rollingCode);
+  json.addElem("command", translateSomfyCommand(static_cast<somfy_commands>(entry.cmd)).c_str());
+  json.addElem("sync", entry.hwsync);
+  json.addElem("bits", entry.bitLength);
+  json.addElem("valid", entry.valid);
+  json.addElem("rssi", (int32_t)entry.rssi);
+  json.endObject();
+}
+static void logTopic(char *topic, size_t size, const char *name) {
+  if(strlen(settings.MQTT.rootTopic) > 0) snprintf(topic, size, "%s/%s", settings.MQTT.rootTopic, name);
+  else strlcpy(topic, name, size);
+}
+// Entries are streamed because PubSubClient drops anything larger than its 256 byte buffer.
+static void publishLogPayload(const char *name, const char *payload) {
+  char topic[128];
+  logTopic(topic, sizeof(topic), name);
+  mqtt.publishBuffer(topic, (uint8_t *)payload, strlen(payload));
+}
+static void publishLogEntry(somfy_tx_log_t &entry) {
+  if(!mqtt.connected()) return;
+  char payload[256];
+  JsonPayload json;
+  json.begin(payload, sizeof(payload));
+  txLogEntryToJSON(json, entry);
+  publishLogPayload("txlog", payload);
+}
+static void publishLogEntry(somfy_rx_log_t &entry) {
+  if(!mqtt.connected()) return;
+  char payload[256];
+  JsonPayload json;
+  json.begin(payload, sizeof(payload));
+  rxLogEntryToJSON(json, entry);
+  publishLogPayload("rxlog", payload);
+}
+static void publishLogSensorDisco(const char *name, const char *label, const char *valueTemplate, const char *unit, const char *deviceClass) {
+  char topic[128] = "";
+  DynamicJsonDocument doc(1024);
+  JsonObject obj = doc.to<JsonObject>();
+  obj["name"] = label;
+  snprintf(topic, sizeof(topic), "mqtt_%s_%s", settings.serverId, name);
+  obj["unique_id"] = topic;
+  logTopic(topic, sizeof(topic), name);
+  obj["state_topic"] = topic;
+  obj["json_attributes_topic"] = topic;
+  obj["value_template"] = valueTemplate;
+  obj["unit_of_measurement"] = unit;
+  if(deviceClass) obj["device_class"] = deviceClass;
+  obj["state_class"] = "measurement";
+  obj["entity_category"] = "diagnostic";
+  logTopic(topic, sizeof(topic), "status");
+  obj["availability_topic"] = topic;
+  obj["payload_available"] = "online";
+  obj["payload_not_available"] = "offline";
+  JsonObject dobj = obj.createNestedObject("device");
+  dobj["hw_version"] = settings.fwVersion.name;
+  dobj["name"] = settings.hostname;
+  dobj["mf"] = "rstrouse";
+  JsonArray arrids = dobj.createNestedArray("identifiers");
+  snprintf(topic, sizeof(topic), "mqtt_espsomfyrts_%s", settings.serverId);
+  arrids.add(topic);
+  dobj["model"] = "ESPSomfy-RTS MQTT";
+  snprintf(topic, sizeof(topic), "%s/sensor/mqtt_%s_%s/config", settings.MQTT.discoTopic, settings.serverId, name);
+  mqtt.publishDisco(topic, obj, true);
+}
+void Transceiver::publishLogDisco() {
+  if(!mqtt.connected()) return;
+  publishLogSensorDisco("txlog", "Transmit log", "{{ value_json.late | max }}", "\u03bcs", nullptr);
+  publishLogSensorDisco("rxlog", "Receive log", "{{ value_json.rssi }}", "dBm", "signal_strength");
+}
 void Transceiver::logReceive(somfy_frame_t &frame) {
   somfy_rx_log_t &entry = this->rxLog[this->rxLogNext];
   entry.time = millis();
@@ -4695,6 +4782,7 @@ void Transceiver::logReceive(somfy_frame_t &frame) {
   entry.valid = frame.valid;
   entry.rssi = frame.rssi;
   this->rxLogNext = (this->rxLogNext + 1) % RX_LOG_SIZE;
+  publishLogEntry(entry);
 }
 // Log times are millis() values, so pair the current one with the wall clock to convert them.
 static void logClockToJSON(JsonResponse &json) {
@@ -4710,18 +4798,7 @@ void Transceiver::txLogToJSON(JsonResponse &json) {
   // Oldest first.
   for(uint16_t n = 0; n < TX_LOG_SIZE; n++) {
     somfy_tx_log_t &entry = this->txLog[(this->txLogNext + n) % TX_LOG_SIZE];
-    if(entry.frames == 0) continue;
-    json.beginObject();
-    json.addElem("time", entry.time);
-    json.addElem("address", entry.remoteAddress);
-    json.addElem("rcode", (uint32_t)entry.rollingCode);
-    json.addElem("command", translateSomfyCommand(static_cast<somfy_commands>(entry.cmd)).c_str());
-    json.addElem("frames", entry.frames);
-    json.addElem("marcState", entry.marcState);
-    json.beginArray("late");
-    for(uint8_t i = 0; i < entry.frames && i < TX_LOG_FRAMES; i++) json.addElem((uint32_t)entry.late[i]);
-    json.endArray();
-    json.endObject();
+    if(entry.frames > 0) txLogEntryToJSON(json, entry);
   }
   json.endArray();
 }
@@ -4732,17 +4809,7 @@ void Transceiver::rxLogToJSON(JsonResponse &json) {
   // Oldest first.
   for(uint16_t n = 0; n < RX_LOG_SIZE; n++) {
     somfy_rx_log_t &entry = this->rxLog[(this->rxLogNext + n) % RX_LOG_SIZE];
-    if(entry.bitLength == 0) continue;
-    json.beginObject();
-    json.addElem("time", entry.time);
-    json.addElem("address", entry.remoteAddress);
-    json.addElem("rcode", (uint32_t)entry.rollingCode);
-    json.addElem("command", translateSomfyCommand(static_cast<somfy_commands>(entry.cmd)).c_str());
-    json.addElem("sync", entry.hwsync);
-    json.addElem("bits", entry.bitLength);
-    json.addElem("valid", entry.valid);
-    json.addElem("rssi", (int32_t)entry.rssi);
-    json.endObject();
+    if(entry.bitLength > 0) rxLogEntryToJSON(json, entry);
   }
   json.endArray();
 }
@@ -5227,5 +5294,6 @@ void Transceiver::endTransmit() {
       ELECHOUSE_cc1101.setSidle();
       //delay(100);
       this->enableReceive();
+      publishLogEntry(this->txCurrent);
     }
 }

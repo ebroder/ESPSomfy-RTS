@@ -545,6 +545,7 @@ class Transceiver {
     void endTransmit();
     void txLogToJSON(JsonResponse &json);
     void rxLogToJSON(JsonResponse &json);
+    void publishLogDisco();
     void emitFrame(somfy_frame_t *frame, somfy_rx_t *rx = nullptr);
     void beginFrequencyScan();
     void endFrequencyScan();

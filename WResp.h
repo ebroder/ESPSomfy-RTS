@@ -52,6 +52,10 @@ class JsonFormatter {
     void addElem(const char* name, bool bval);
     void addElem(const char *name, const char *val);
 };
+class JsonPayload : public JsonFormatter {
+  public:
+    void begin(char *buff, size_t buffSize);
+};
 class JsonResponse : public JsonFormatter {
   protected:
     void _safecat(const char *val, bool escape = false) override;
