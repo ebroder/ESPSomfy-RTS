@@ -2280,6 +2280,24 @@ void Web::begin() {
     resp.endObject();
     resp.endResponse();
     });
+  server.on("/txLog", []() {
+    webServer.sendCORSHeaders(server);
+    JsonResponse resp;
+    resp.beginResponse(&server, g_content, sizeof(g_content));
+    resp.beginObject();
+    somfy.transceiver.txLogToJSON(resp);
+    resp.endObject();
+    resp.endResponse();
+    });
+  server.on("/rxLog", []() {
+    webServer.sendCORSHeaders(server);
+    JsonResponse resp;
+    resp.beginResponse(&server, g_content, sizeof(g_content));
+    resp.beginObject();
+    somfy.transceiver.rxLogToJSON(resp);
+    resp.endObject();
+    resp.endResponse();
+    });
   server.on("/sendRemoteCommand", []() {
     webServer.sendCORSHeaders(server);
     if(server.method() == HTTP_OPTIONS) { server.send(200, "OK"); return; }

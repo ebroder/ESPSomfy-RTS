@@ -3,6 +3,7 @@
 #include <SPI.h>
 #include <WebServer.h>
 #include <esp_task_wdt.h>
+#include <esp_timer.h>
 #include "Utils.h"
 #include "ConfigSettings.h"
 #include "Somfy.h"
@@ -4001,7 +4002,7 @@ void SomfyRemote::repeatFrame(uint8_t repeat) {
     this->triggerGPIOs(this->lastFrame);
     return;
   }
-  somfy.transceiver.beginTransmit();
+  somfy.transceiver.beginTransmit(this->lastFrame);
   byte frm[10];
   this->lastFrame.encodeFrame(frm);
   this->lastFrame.repeats++;
@@ -4016,7 +4017,7 @@ void SomfyRemote::repeatFrame(uint8_t repeat) {
   //somfy.processFrame(this->lastFrame, true);
 }
 void SomfyShadeController::sendFrame(somfy_frame_t &frame, uint8_t repeat) {
-  somfy.transceiver.beginTransmit();
+  somfy.transceiver.beginTransmit(frame);
   byte frm[10];
   frame.encodeFrame(frm);
   this->transceiver.sendFrame(frm, frame.bitLength == 56 ? 2 : 12, frame.bitLength);
@@ -4316,6 +4317,14 @@ bool somfy_rx_queue_t::pop(somfy_rx_t *rx) {
   return false;
 }
 
+// Spins like delayMicroseconds and keeps the largest overshoot, which is how far the pulse
+// it times was stretched.
+static inline void txDelay(uint32_t us, uint16_t &late) {
+  const int64_t start = esp_timer_get_time();
+  delayMicroseconds(us);
+  const int64_t over = esp_timer_get_time() - start - us;
+  if(over > late) late = over > 0xFFFF ? 0xFFFF : (uint16_t)over;
+}
 void Transceiver::sendFrame(byte *frame, uint8_t sync, uint8_t bitLength) {
   if(!this->config.enabled) return;
   uint32_t pin = 1 << this->config.TXPin;
@@ -4341,41 +4350,46 @@ void Transceiver::sendFrame(byte *frame, uint8_t sync, uint8_t bitLength) {
   // enough to corrupt the frame, so we bump the priority until the last data bit.
   const UBaseType_t priority = uxTaskPriorityGet(NULL);
   vTaskPrioritySet(NULL, configMAX_PRIORITIES - 1);
+  uint16_t late = 0;
   // Depending on the bitness of the protocol we will be sending a different hwsync.
   // 56-bit 2 pulses for the first frame and 7 for the repeats
   // 80-bit 24 pulses for the first frame and 14 pulses for the repeats
   for (int i = 0; i < sync; i++) {
     REG_WRITE(GPIO_OUT_W1TS_REG, pin);
-    delayMicroseconds(4 * SYMBOL);
+    txDelay(4 * SYMBOL, late);
     REG_WRITE(GPIO_OUT_W1TC_REG, pin);
-    delayMicroseconds(4 * SYMBOL);
+    txDelay(4 * SYMBOL, late);
   }
   // Software sync
   REG_WRITE(GPIO_OUT_W1TS_REG, pin);
   //delayMicroseconds(4450); -- Initial timing.
-  delayMicroseconds(4850);
+  txDelay(4850, late);
   // Start 0
   REG_WRITE(GPIO_OUT_W1TC_REG, pin);
-  delayMicroseconds(SYMBOL);
+  txDelay(SYMBOL, late);
   // Payload starting with the most significant bit.  The frame is always supplied in 80 bits
   // but if the protocol is calling for 56 bits it will only send 56 bits of the frame.
   uint8_t last_bit = 0;
   for (byte i = 0; i < bitLength; i++) {
     if (((frame[i / 8] >> (7 - (i % 8))) & 1) == 1) {
       REG_WRITE(GPIO_OUT_W1TC_REG, pin);
-      delayMicroseconds(SYMBOL);
+      txDelay(SYMBOL, late);
       REG_WRITE(GPIO_OUT_W1TS_REG, pin);
-      delayMicroseconds(SYMBOL);
+      txDelay(SYMBOL, late);
       last_bit = 1;
     } else {
       REG_WRITE(GPIO_OUT_W1TS_REG, pin);
-      delayMicroseconds(SYMBOL);
+      txDelay(SYMBOL, late);
       REG_WRITE(GPIO_OUT_W1TC_REG, pin);
-      delayMicroseconds(SYMBOL);
+      txDelay(SYMBOL, late);
       last_bit = 0;
     }
   }
   vTaskPrioritySet(NULL, priority);
+  somfy_tx_log_t &entry = this->txCurrent;
+  uint16_t &slot = entry.late[entry.frames < TX_LOG_FRAMES ? entry.frames : TX_LOG_FRAMES - 1];
+  if(late > slot) slot = late;
+  if(entry.frames < 255) entry.frames++;
   // End with a 0 no matter what.  This accommodates the 56-bit protocol by telling the
   // motor that there are no more follow on bits.
   if(last_bit == 0) {
@@ -4607,6 +4621,7 @@ bool Transceiver::receive(somfy_rx_t *rx) {
       //Serial.printf("Processing receive %d\n", rx_queue.length);
       rx_queue.pop(rx);
       this->frame.decodeFrame(rx);
+      this->logReceive(this->frame);
       this->emitFrame(&this->frame, rx);
       return this->frame.valid;
     }
@@ -4668,6 +4683,68 @@ void Transceiver::emitFrame(somfy_frame_t *frame, somfy_rx_t *rx) {
     sockEmit.sendToRoom(ROOM_EMIT_FRAME, &evt);
     */
   }
+}
+void Transceiver::logReceive(somfy_frame_t &frame) {
+  somfy_rx_log_t &entry = this->rxLog[this->rxLogNext];
+  entry.time = millis();
+  entry.remoteAddress = frame.remoteAddress;
+  entry.rollingCode = frame.rollingCode;
+  entry.cmd = static_cast<uint8_t>(frame.cmd);
+  entry.hwsync = frame.hwsync;
+  entry.bitLength = frame.bitLength;
+  entry.valid = frame.valid;
+  entry.rssi = frame.rssi;
+  this->rxLogNext = (this->rxLogNext + 1) % RX_LOG_SIZE;
+}
+// Log times are millis() values, so pair the current one with the wall clock to convert them.
+static void logClockToJSON(JsonResponse &json) {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  json.addElem("millis", (uint32_t)millis());
+  json.addElem("epoch", (uint32_t)tv.tv_sec);
+  json.addElem("epochMs", (uint32_t)(tv.tv_usec / 1000));
+}
+void Transceiver::txLogToJSON(JsonResponse &json) {
+  logClockToJSON(json);
+  json.beginArray("transmissions");
+  // Oldest first.
+  for(uint16_t n = 0; n < TX_LOG_SIZE; n++) {
+    somfy_tx_log_t &entry = this->txLog[(this->txLogNext + n) % TX_LOG_SIZE];
+    if(entry.frames == 0) continue;
+    json.beginObject();
+    json.addElem("time", entry.time);
+    json.addElem("address", entry.remoteAddress);
+    json.addElem("rcode", (uint32_t)entry.rollingCode);
+    json.addElem("command", translateSomfyCommand(static_cast<somfy_commands>(entry.cmd)).c_str());
+    json.addElem("frames", entry.frames);
+    json.addElem("marcState", entry.marcState);
+    json.beginArray("late");
+    for(uint8_t i = 0; i < entry.frames && i < TX_LOG_FRAMES; i++) json.addElem((uint32_t)entry.late[i]);
+    json.endArray();
+    json.endObject();
+  }
+  json.endArray();
+}
+void Transceiver::rxLogToJSON(JsonResponse &json) {
+  logClockToJSON(json);
+  if(rxmode == 1) json.addElem("rssi", (int32_t)ELECHOUSE_cc1101.getRssi());
+  json.beginArray("frames");
+  // Oldest first.
+  for(uint16_t n = 0; n < RX_LOG_SIZE; n++) {
+    somfy_rx_log_t &entry = this->rxLog[(this->rxLogNext + n) % RX_LOG_SIZE];
+    if(entry.bitLength == 0) continue;
+    json.beginObject();
+    json.addElem("time", entry.time);
+    json.addElem("address", entry.remoteAddress);
+    json.addElem("rcode", (uint32_t)entry.rollingCode);
+    json.addElem("command", translateSomfyCommand(static_cast<somfy_commands>(entry.cmd)).c_str());
+    json.addElem("sync", entry.hwsync);
+    json.addElem("bits", entry.bitLength);
+    json.addElem("valid", entry.valid);
+    json.addElem("rssi", (int32_t)entry.rssi);
+    json.endObject();
+  }
+  json.endArray();
 }
 void Transceiver::clearReceived(void) {
     //packet_received = false;
@@ -5098,10 +5175,12 @@ void Transceiver::loop() {
     somfy.processWaitingFrame();
     // Check to see if there is anything in the buffer
     if(tx_queue.length > 0 && millis() > tx_queue.delay_time && somfy_rx.cpt_synchro_hw == 0) {
-      this->beginTransmit();
       somfy_tx_t tx;
-      
       tx_queue.pop(&tx);
+      somfy_frame_t txFrame;
+      txFrame.bitLength = tx.bit_length;
+      txFrame.decodeFrame(tx.payload);
+      this->beginTransmit(txFrame);
       Serial.printf("Sending frame %d - %d-BIT [", tx.hwsync, tx.bit_length);
       for(uint8_t j = 0; j < 10; j++) {
         Serial.print(tx.payload[j]);
@@ -5127,8 +5206,13 @@ void Transceiver::loop() {
   }
 }
 somfy_frame_t& Transceiver::lastFrame() { return this->frame; }
-void Transceiver::beginTransmit() {
+void Transceiver::beginTransmit(somfy_frame_t &frame) {
     if(this->config.enabled) {
+      this->txCurrent = somfy_tx_log_t();
+      this->txCurrent.time = millis();
+      this->txCurrent.remoteAddress = frame.remoteAddress;
+      this->txCurrent.rollingCode = frame.rollingCode;
+      this->txCurrent.cmd = static_cast<uint8_t>(frame.cmd);
       this->disableReceive();
       pinMode(this->config.TXPin, OUTPUT);
       digitalWrite(this->config.TXPin, 0);
@@ -5137,6 +5221,9 @@ void Transceiver::beginTransmit() {
 }
 void Transceiver::endTransmit() {
     if(this->config.enabled) {
+      this->txCurrent.marcState = ELECHOUSE_cc1101.SpiReadStatus(CC1101_MARCSTATE) & 0x1F;
+      this->txLog[this->txLogNext] = this->txCurrent;
+      this->txLogNext = (this->txLogNext + 1) % TX_LOG_SIZE;
       ELECHOUSE_cc1101.setSidle();
       //delay(100);
       this->enableReceive();

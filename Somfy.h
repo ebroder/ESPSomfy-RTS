@@ -152,6 +152,28 @@ struct somfy_tx_queue_t {
   void push(somfy_rx_t *rx); // Used for repeats
   void push(uint8_t hwsync, byte *payload, uint8_t bit_length);
 };
+#define TX_LOG_SIZE 64
+#define TX_LOG_FRAMES 8
+#define RX_LOG_SIZE 256
+struct somfy_tx_log_t {
+  uint32_t time = 0;          // millis() when the transmission began.
+  uint32_t remoteAddress = 0;
+  uint16_t rollingCode = 0;
+  uint8_t cmd = 0;
+  uint8_t frames = 0;
+  uint8_t marcState = 0;      // CC1101 MARCSTATE after the last frame.  0x13 is TX.
+  uint16_t late[TX_LOG_FRAMES] = {0};  // Worst overshoot of any edge in each frame in microseconds.  The last slot also covers any later frames.
+};
+struct somfy_rx_log_t {
+  uint32_t time = 0;          // millis() when the frame was decoded.
+  uint32_t remoteAddress = 0;
+  uint16_t rollingCode = 0;
+  uint8_t cmd = 0;
+  uint8_t hwsync = 0;
+  uint8_t bitLength = 0;
+  bool valid = false;
+  int16_t rssi = 0;
+};
 
 enum class somfy_flags_t : byte {
     SunFlag = 0x01,
@@ -497,6 +519,12 @@ class Transceiver {
     static void handleReceive();
     bool _received = false;
     somfy_frame_t frame;
+    somfy_tx_log_t txLog[TX_LOG_SIZE];
+    somfy_tx_log_t txCurrent;
+    uint16_t txLogNext = 0;
+    somfy_rx_log_t rxLog[RX_LOG_SIZE];
+    uint16_t rxLogNext = 0;
+    void logReceive(somfy_frame_t &frame);
   public:
     transceiver_config_t config;
     bool printBuffer = false;
@@ -513,8 +541,10 @@ class Transceiver {
     void disableReceive();
     somfy_frame_t& lastFrame();
     void sendFrame(byte *frame, uint8_t sync, uint8_t bitLength = 56);
-    void beginTransmit();
+    void beginTransmit(somfy_frame_t &frame);
     void endTransmit();
+    void txLogToJSON(JsonResponse &json);
+    void rxLogToJSON(JsonResponse &json);
     void emitFrame(somfy_frame_t *frame, somfy_rx_t *rx = nullptr);
     void beginFrequencyScan();
     void endFrequencyScan();
