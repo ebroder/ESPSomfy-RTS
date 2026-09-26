@@ -4240,6 +4240,7 @@ void SomfyShadeController::loop() {
   if(this->isDirty && millis() - this->lastCommit > 1000) {
     this->commit();
   }
+  this->transceiver.publishLogs();
 }
 SomfyLinkedRemote::SomfyLinkedRemote() {}
 
@@ -4801,7 +4802,23 @@ void Transceiver::logReceive(somfy_frame_t &frame) {
   entry.valid = frame.valid;
   entry.rssi = frame.rssi;
   this->rxLogNext = (this->rxLogNext + 1) % RX_LOG_SIZE;
-  publishLogEntry(entry);
+}
+// A publish can block for seconds when the broker stalls, so this must not run from endTransmit(),
+// which returns before processFrame() starts tracking the move.
+void Transceiver::publishLogs() {
+  if(!mqtt.connected()) {
+    this->txLogPublished = this->txLogNext;
+    this->rxLogPublished = this->rxLogNext;
+    return;
+  }
+  while(this->txLogPublished != this->txLogNext) {
+    publishLogEntry(this->txLog[this->txLogPublished]);
+    this->txLogPublished = (this->txLogPublished + 1) % TX_LOG_SIZE;
+  }
+  while(this->rxLogPublished != this->rxLogNext) {
+    publishLogEntry(this->rxLog[this->rxLogPublished]);
+    this->rxLogPublished = (this->rxLogPublished + 1) % RX_LOG_SIZE;
+  }
 }
 // Log times are millis() values, so pair the current one with the wall clock to convert them.
 static void logClockToJSON(JsonResponse &json) {
@@ -5313,6 +5330,5 @@ void Transceiver::endTransmit() {
       ELECHOUSE_cc1101.setSidle();
       //delay(100);
       this->enableReceive();
-      publishLogEntry(this->txCurrent);
     }
 }

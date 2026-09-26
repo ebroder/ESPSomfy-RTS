@@ -522,8 +522,10 @@ class Transceiver {
     somfy_tx_log_t txLog[TX_LOG_SIZE];
     somfy_tx_log_t txCurrent;
     uint16_t txLogNext = 0;
+    uint16_t txLogPublished = 0;
     somfy_rx_log_t rxLog[RX_LOG_SIZE];
     uint16_t rxLogNext = 0;
+    uint16_t rxLogPublished = 0;
     void logReceive(somfy_frame_t &frame);
   public:
     transceiver_config_t config;
@@ -546,6 +548,7 @@ class Transceiver {
     void txLogToJSON(JsonResponse &json);
     void rxLogToJSON(JsonResponse &json);
     void publishLogDisco();
+    void publishLogs();
     void emitFrame(somfy_frame_t *frame, somfy_rx_t *rx = nullptr);
     void beginFrequencyScan();
     void endFrequencyScan();
