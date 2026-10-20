@@ -2,6 +2,7 @@
 #include <ArduinoJson.h>
 #include <WebSocketsServer.h>
 #include <esp_task_wdt.h>
+#include <lwip/sockets.h>
 #include "Sockets.h"
 #include "ConfigSettings.h"
 #include "Somfy.h"
@@ -15,10 +16,46 @@ extern SocketEmitter sockEmit;
 extern GitUpdater git;
 
 
-WebSocketsServer sockServer = WebSocketsServer(8080);
+// WiFiClient::write waits up to 10s for a client that has stopped reading, past the
+// 7s loop watchdog, so such a client is dropped once it has had no room for this long.
+#define SOCK_STALL_TIMEOUT 1000
+
+class SocketServer : public WebSocketsServer {
+  public:
+    using WebSocketsServer::WebSocketsServer;
+    void loop();
+    void dropStalledClients(uint8_t num = 255);
+};
+SocketServer sockServer = SocketServer(8080);
 
 #define MAX_SOCK_RESPONSE 2048
+// lwIP only reports a socket writable with more than TCP_SNDLOWAT bytes free, so a
+// frame this size (plus its 4-byte header) goes out without waiting.
+static_assert(MAX_SOCK_RESPONSE + 4 <= TCP_SNDLOWAT, "socket frames must fit in a writable socket's free space");
 static char g_response[MAX_SOCK_RESPONSE];
+
+void SocketServer::loop() {
+  this->dropStalledClients();
+  WebSocketsServer::loop();
+}
+void SocketServer::dropStalledClients(uint8_t num) {
+  for(uint8_t i = 0; i < WEBSOCKETS_SERVER_CLIENT_MAX; i++) {
+    if(num != 255 && i != num) continue;
+    WSclient_t *client = &this->_clients[i];
+    if(!this->clientIsConnected(client)) continue;
+    int fd = client->tcp->fd();
+    fd_set set;
+    FD_ZERO(&set);
+    FD_SET(fd, &set);
+    struct timeval tv = { SOCK_STALL_TIMEOUT / 1000, (SOCK_STALL_TIMEOUT % 1000) * 1000 };
+    if(select(fd + 1, NULL, &set, NULL, &tv) > 0) continue;
+    Serial.printf("Socket [%u] stopped reading, dropping it\n", i);
+    // close() waits up to 20s when it can't queue the FIN.
+    struct timeval closeTimeout = { 0, 100000 };
+    client->tcp->setSocketOption(SO_SNDTIMEO, (char *)&closeTimeout, sizeof(closeTimeout));
+    this->clientDisconnect(client);
+  }
+}
 
 bool room_t::isJoined(uint8_t num) {
   for(uint8_t i = 0; i < sizeof(this->clients); i++) { 
@@ -90,12 +127,21 @@ JsonSockEvent *SocketEmitter::beginEmit(const char *evt) {
   this->json.beginEvent(&sockServer, evt, g_response, sizeof(g_response));
   return &this->json;
 }
-void SocketEmitter::endEmit(uint8_t num) { this->json.endEvent(num); sockServer.loop(); }
+void SocketEmitter::endEmit(uint8_t num) {
+  sockServer.dropStalledClients(num);
+  this->json.endEvent(num);
+  sockServer.loop();
+}
 void SocketEmitter::endEmitRoom(uint8_t room) {
   if(room < SOCK_MAX_ROOMS) {
     room_t *r = &this->rooms[room];
     for(uint8_t i = 0; i < sizeof(r->clients); i++) {
-      if(r->clients[i] != 255) this->json.endEvent(r->clients[i]);
+      // Dropping a client sets its slot here to 255, which endEvent would broadcast to.
+      uint8_t num = r->clients[i];
+      if(num != 255) {
+        sockServer.dropStalledClients(num);
+        this->json.endEvent(num);
+      }
     }
   }
 }
